@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: knotshorts-summarizer
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    healthCheckPath: "/"
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: SUMMARY_MODEL
+        value: "openai/gpt-4.1-nano"
+      - key: SUMMARY_MAX_TOKENS
+        value: "120"
