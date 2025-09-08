@@ -18,6 +18,8 @@ app.get('/', (_req, res) => res.json({ ok: true })); // health check
 
 app.post('/summarize', async (req, res) => {
   const { text } = req.body;
+  console.log(`→ /summarize ${new Date().toISOString()} len=${(text || '').length}`);
+
   if (!text || String(text).trim().length === 0) {
     return res.status(400).json({ error: 'Text is required for summarization.' });
   }
@@ -45,6 +47,8 @@ app.post('/summarize', async (req, res) => {
     );
 
     const summary = r?.data?.choices?.[0]?.message?.content || '';
+    console.log(`← /summarize 200 len=${(summary || '').length}`);
+
     res.json({ summary });
   } catch (err) {
     const status = err?.response?.status || 500;
