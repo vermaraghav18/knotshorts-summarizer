@@ -16,11 +16,11 @@ const PORT = process.env.PORT || 5000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
 // ---------------- Tunables (speed-friendly defaults) ----------------
-const SUMMARY_MODEL = process.env.SUMMARY_MODEL || 'google/gemini-1.5-flash';
+const SUMMARY_MODEL = process.env.SUMMARY_MODEL || 'openai/gpt-4o-mini';
 const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 120);
 
-const MIN_WORDS = Number(process.env.SUMMARY_MIN_WORDS || 60);
-const MAX_WORDS = Number(process.env.SUMMARY_MAX_WORDS || 75);
+const MIN_WORDS = Number(process.env.SUMMARY_MIN_WORDS || 45);
+const MAX_WORDS = Number(process.env.SUMMARY_MAX_WORDS || 60);
 // Disable second pass expansion for latency (set to 1 if you insist on >=MIN_WORDS)
 const EXPANSION_RETRIES = Number(process.env.SUMMARY_EXPANSION_RETRIES || 0);
 
