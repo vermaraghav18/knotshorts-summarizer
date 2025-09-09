@@ -1,78 +1,92 @@
-// summarizer-server.js — OpenRouter summarizer (STRICT 40–55 words, 1 paragraph)
+// summarizer-server.js — Fast OpenRouter summarizer (single paragraph, 60–75 words)
+// Features: HTTP keep-alive, input trimming, strict word window, lightweight in-memory cache.
+
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const crypto = require('crypto');
+const httpMod = require('http');
+const httpsMod = require('https');
 
 const app = express();
-app.use(bodyParser.json());
-app.use(cors({ origin: '*' })); // tighten in prod
+app.use(bodyParser.json({ limit: '256kb' }));
+app.use(cors({ origin: '*' })); // tighten for prod
 
 const PORT = process.env.PORT || 5000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
-// ------------------ Tunables (kept tiny) ------------------
-const SUMMARY_MODEL = process.env.SUMMARY_MODEL || 'openai/gpt-4.1-nano';
-const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 140);
+// ------------------ Tunables (you can also set these in .env) ------------------
+const SUMMARY_MODEL      = process.env.SUMMARY_MODEL || 'openai/gpt-4o-mini'; // fast + concise
+const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 110);     // keep small for speed
 
-// HARD word range (inclusive) — concise!
-const MIN_WORDS = Number(process.env.SUMMARY_MIN_WORDS || 40);
-const MAX_WORDS = Number(process.env.SUMMARY_MAX_WORDS || 55);
-const TARGET_WORDS = Math.round((MIN_WORDS + MAX_WORDS) / 2); // ~48
+// Hard target window
+const MIN_WORDS = Number(process.env.SUMMARY_MIN_WORDS || 60);
+const MAX_WORDS = Number(process.env.SUMMARY_MAX_WORDS || 75);
 
-// If first pass < MIN_WORDS, retry once to expand
+// Trim input so we don’t waste tokens/time on huge articles
+const INPUT_MAX_CHARS = Number(process.env.SUMMARY_INPUT_MAX_CHARS || 1400);
+
+// Retry once to expand if the first pass undershoots MIN_WORDS
 const EXPANSION_RETRIES = Number(process.env.SUMMARY_EXPANSION_RETRIES || 1);
-// ----------------------------------------------------------
+
+// Keep-alive sockets → lower latency across many requests
+const httpAgent  = new httpMod.Agent({ keepAlive: true, maxSockets: 128, keepAliveMsecs: 60_000 });
+const httpsAgent = new httpsMod.Agent({ keepAlive: true, maxSockets: 128, keepAliveMsecs: 60_000 });
 
 const http = axios.create({
   baseURL: 'https://openrouter.ai/api/v1',
   headers: {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
   },
-  timeout: 30000,
+  httpAgent,
+  httpsAgent,
+  timeout: 15000,
 });
 
-// ---------- helpers ----------
+// ------------------ tiny in-memory cache (LRU-ish) ------------------
+const CACHE_MAX = Number(process.env.SUMMARY_CACHE_MAX || 800);
+const CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
+const _cache = new Map(); // key -> { value, t }
+
+function _cacheGet(key) {
+  const hit = _cache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.t > CACHE_TTL_MS) {
+    _cache.delete(key);
+    return null;
+  }
+  // refresh recency
+  _cache.delete(key);
+  _cache.set(key, hit);
+  return hit.value;
+}
+function _cacheSet(key, value) {
+  if (_cache.size >= CACHE_MAX) {
+    const first = _cache.keys().next().value;
+    if (first) _cache.delete(first);
+  }
+  _cache.set(key, { value, t: Date.now() });
+}
+
 function normalizeWhitespace(s) {
-  // collapse whitespace; also collapse newlines to spaces (single paragraph)
   return String(s || '')
-    .replace(/[ \t\r\f\v]+/g, ' ')
-    .replace(/\s*\n+\s*/g, ' ')
+    .replace(/[\r\n]+/g, ' ')   // no line breaks at all
+    .replace(/[ \t\f\v]+/g, ' ') // collapse spaces/tabs
     .trim();
 }
-
-function stripBulletsAndMarkers(s) {
-  return s
-    .split('\n')
-    .map(l => l.replace(/^\s*[-•\d]+\)?\.?\s*/g, '').trim())
-    .filter(Boolean)
-    .join(' ');
-}
-
 function countWords(s) {
-  const words = normalizeWhitespace(s).split(/\s+/).filter(Boolean);
-  return words.length;
+  return normalizeWhitespace(s).split(/\s+/).filter(Boolean).length;
 }
-
 function hardTrimToMaxWords(s, max) {
   const words = normalizeWhitespace(s).split(/\s+/).filter(Boolean);
   if (words.length <= max) return words.join(' ');
-  let out = words.slice(0, max).join(' ');
-  out = out.replace(/[,:;—–-]+$/g, '').replace(/\s+$/g, '');
-  if (!/[.!?]$/.test(out)) out += '.';
-  return out;
+  return words.slice(0, max).join(' ');
 }
-
-function postProcess(raw) {
-  // 1) normalize, remove bullets, force one paragraph
-  let s = stripBulletsAndMarkers(normalizeWhitespace(raw));
-  // 2) kill accidental line breaks
-  s = s.replace(/\s*\n+\s*/g, ' ');
-  // 3) collapse multiple spaces
-  s = s.replace(/\s{2,}/g, ' ').trim();
-  return s;
+function sha1(s) {
+  return crypto.createHash('sha1').update(s).digest('hex');
 }
 
 async function callOpenRouter(messages) {
@@ -80,80 +94,96 @@ async function callOpenRouter(messages) {
     model: SUMMARY_MODEL,
     messages,
     max_tokens: SUMMARY_MAX_TOKENS,
-    temperature: 0.15, // tighter/shorter
-    top_p: 0.9,
+    temperature: 0.2,
+    top_p: 0.7,
   });
   return data?.choices?.[0]?.message?.content || '';
 }
 
-async function generateFirstPass(text) {
+async function firstPass(text) {
   const system = [
-    'You are a precise news summarizer.',
-    `Write ONE paragraph between ${MIN_WORDS} and ${MAX_WORDS} words (strict).`,
-    `Aim for about ${TARGET_WORDS} words.`,
-    'No bullets, no lists, no headings, no line breaks; return plain text.',
-    'Neutral, concise, easy to scan; keep only the most essential facts.',
+    'You are a fast, precise news summarizer.',
+    `Return ONE single paragraph of ${MIN_WORDS}-${MAX_WORDS} words.`,
+    'Absolutely no line breaks, bullets, or numbering.',
+    'Be clear, neutral, and compact; focus on what happened and why it matters.',
   ].join(' ');
-
-  const messages = [
+  return await callOpenRouter([
     { role: 'system', content: system },
-    { role: 'user', content: String(text) },
-  ];
-
-  return await callOpenRouter(messages);
+    { role: 'user', content: text },
+  ]);
 }
 
-async function expandSummary(text, current) {
+async function expandPass(text, current) {
   const system = [
-    'Expand the summary slightly while staying strictly faithful to the source.',
-    `Return ONE paragraph between ${MIN_WORDS} and ${MAX_WORDS} words.`,
-    `Aim near ${TARGET_WORDS} words. No bullets, no lists, no line breaks.`,
-    'Keep it crisp and readable—only important facts.',
+    'Improve and EXPAND this summary slightly while staying faithful to the source.',
+    `Return ONE single paragraph of at least ${MIN_WORDS} words but not more than ${MAX_WORDS}.`,
+    'No line breaks, bullets, or lists.',
   ].join(' ');
-
-  const messages = [
+  return await callOpenRouter([
     { role: 'system', content: system },
-    { role: 'user', content: `SOURCE:\n${String(text)}` },
-    { role: 'user', content: `CURRENT SUMMARY:\n${String(current)}` },
-  ];
+    { role: 'user', content: `SOURCE:\n${text}` },
+    { role: 'user', content: `CURRENT:\n${current}` },
+  ]);
+}
 
-  return await callOpenRouter(messages);
+function postProcess(raw) {
+  // single paragraph only
+  let s = normalizeWhitespace(raw);
+
+  // if model slipped bullets/nums, strip leading markers
+  s = s.replace(/(^|\s)[-•\d]+\)?\.?\s+/g, ' ');
+
+  // enforce hard upper bound (fast and predictable)
+  s = hardTrimToMaxWords(s, MAX_WORDS);
+
+  // ensure lower bound only if we already expanded in caller
+  return s;
 }
 
 // ----------------------------------------------
-
 app.get('/', (_req, res) => res.json({ ok: true })); // health check
 
 app.post('/summarize', async (req, res) => {
-  const { text } = req.body;
-  console.log(`→ /summarize ${new Date().toISOString()} len=${(text || '').length}`);
+  let { text } = req.body;
+  const rawLen = (text || '').length;
+  console.log(`→ /summarize ${new Date().toISOString()} len=${rawLen}`);
 
   if (!text || String(text).trim().length === 0) {
     return res.status(400).json({ error: 'Text is required for summarization.' });
   }
 
+  // Trim giant inputs to keep latency low
+  if (text.length > INPUT_MAX_CHARS) text = text.slice(0, INPUT_MAX_CHARS);
+
+  const key = sha1(`${SUMMARY_MODEL}|${MIN_WORDS}|${MAX_WORDS}|${text}`);
+  const cached = _cacheGet(key);
+  if (cached) {
+    console.log(`← /summarize 200 (cache) words≈${countWords(cached)}`);
+    return res.json({ summary: cached });
+  }
+
   try {
     // First attempt
-    let raw = await generateFirstPass(text);
+    let raw = await firstPass(text);
     let summary = postProcess(raw);
     let words = countWords(summary);
 
-    // Retry to meet MIN_WORDS if needed
-    let retriesLeft = EXPANSION_RETRIES;
-    while (words < MIN_WORDS && retriesLeft > 0) {
-      const expanded = await expandSummary(text, summary);
+    // Expand if too short
+    let retries = EXPANSION_RETRIES;
+    while (words < MIN_WORDS && retries-- > 0) {
+      const expanded = await expandPass(text, summary);
       summary = postProcess(expanded);
       words = countWords(summary);
-      retriesLeft--;
     }
 
-    // Enforce upper bound — never exceed MAX_WORDS
+    // Safety: re-trim if the model overshot (rare with hardTrim)
     if (words > MAX_WORDS) {
       summary = hardTrimToMaxWords(summary, MAX_WORDS);
       words = countWords(summary);
     }
 
-    console.log(`← /summarize 200 words=${words}`);
+    _cacheSet(key, summary);
+    console.log(`← /summarize 200 words≈${words}`);
     return res.json({ summary });
   } catch (err) {
     const status = err?.response?.status || 500;
@@ -162,8 +192,8 @@ app.post('/summarize', async (req, res) => {
 
     if (status === 402) {
       return res.status(502).json({
-        error: 'OpenRouter credits/limit error. Reduce max_tokens or add credits.',
-        details: data?.error?.message || 'Requires more credits or fewer tokens.',
+        error: 'OpenRouter credits/limit error. Add credits or reduce usage.',
+        details: data?.error?.message || 'Requires more credits.',
       });
     }
     return res.status(500).json({ error: 'Failed to summarize', details: data || err.message });
