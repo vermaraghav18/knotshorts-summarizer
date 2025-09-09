@@ -1,4 +1,4 @@
-// summarizer-server.js — OpenRouter summarizer (STRICT 60–75 words, 1 paragraph)
+// summarizer-server.js — OpenRouter summarizer (STRICT 40–55 words, 1 paragraph)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -7,23 +7,23 @@ const cors = require('cors');
 
 const app = express();
 app.use(bodyParser.json());
-app.use(cors({ origin: '*' })); // tighten to your domains in prod
+app.use(cors({ origin: '*' })); // tighten in prod
 
 const PORT = process.env.PORT || 5000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
-// ------------------ Tunables ------------------
+// ------------------ Tunables (kept tiny) ------------------
 const SUMMARY_MODEL = process.env.SUMMARY_MODEL || 'openai/gpt-4.1-nano';
-const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 180);
+const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 140);
 
-// HARD word range (inclusive)
-const MIN_WORDS = Number(process.env.SUMMARY_MIN_WORDS || 60);
-const MAX_WORDS = Number(process.env.SUMMARY_MAX_WORDS || 75);
-const TARGET_WORDS = Math.round((MIN_WORDS + MAX_WORDS) / 2);
+// HARD word range (inclusive) — concise!
+const MIN_WORDS = Number(process.env.SUMMARY_MIN_WORDS || 40);
+const MAX_WORDS = Number(process.env.SUMMARY_MAX_WORDS || 55);
+const TARGET_WORDS = Math.round((MIN_WORDS + MAX_WORDS) / 2); // ~48
 
-// If first pass < MIN_WORDS, retry once with an "expand" prompt
+// If first pass < MIN_WORDS, retry once to expand
 const EXPANSION_RETRIES = Number(process.env.SUMMARY_EXPANSION_RETRIES || 1);
-// ------------------------------------------------
+// ----------------------------------------------------------
 
 const http = axios.create({
   baseURL: 'https://openrouter.ai/api/v1',
@@ -59,9 +59,7 @@ function countWords(s) {
 function hardTrimToMaxWords(s, max) {
   const words = normalizeWhitespace(s).split(/\s+/).filter(Boolean);
   if (words.length <= max) return words.join(' ');
-  // preserve punctuation by trimming on word boundary
   let out = words.slice(0, max).join(' ');
-  // ensure we end cleanly
   out = out.replace(/[,:;—–-]+$/g, '').replace(/\s+$/g, '');
   if (!/[.!?]$/.test(out)) out += '.';
   return out;
@@ -70,13 +68,10 @@ function hardTrimToMaxWords(s, max) {
 function postProcess(raw) {
   // 1) normalize, remove bullets, force one paragraph
   let s = stripBulletsAndMarkers(normalizeWhitespace(raw));
-
-  // 2) kill accidental headings/line breaks
+  // 2) kill accidental line breaks
   s = s.replace(/\s*\n+\s*/g, ' ');
-
   // 3) collapse multiple spaces
   s = s.replace(/\s{2,}/g, ' ').trim();
-
   return s;
 }
 
@@ -85,7 +80,7 @@ async function callOpenRouter(messages) {
     model: SUMMARY_MODEL,
     messages,
     max_tokens: SUMMARY_MAX_TOKENS,
-    temperature: 0.2,
+    temperature: 0.15, // tighter/shorter
     top_p: 0.9,
   });
   return data?.choices?.[0]?.message?.content || '';
@@ -97,7 +92,7 @@ async function generateFirstPass(text) {
     `Write ONE paragraph between ${MIN_WORDS} and ${MAX_WORDS} words (strict).`,
     `Aim for about ${TARGET_WORDS} words.`,
     'No bullets, no lists, no headings, no line breaks; return plain text.',
-    'Neutral, concise, factual; do not add speculation.',
+    'Neutral, concise, easy to scan; keep only the most essential facts.',
   ].join(' ');
 
   const messages = [
@@ -110,10 +105,10 @@ async function generateFirstPass(text) {
 
 async function expandSummary(text, current) {
   const system = [
-    'Expand the following summary while staying strictly faithful to the source.',
+    'Expand the summary slightly while staying strictly faithful to the source.',
     `Return ONE paragraph between ${MIN_WORDS} and ${MAX_WORDS} words.`,
     `Aim near ${TARGET_WORDS} words. No bullets, no lists, no line breaks.`,
-    'Keep a clean, neutral news tone. No extra commentary.',
+    'Keep it crisp and readable—only important facts.',
   ].join(' ');
 
   const messages = [
@@ -158,7 +153,6 @@ app.post('/summarize', async (req, res) => {
       words = countWords(summary);
     }
 
-    // Safety: if still below MIN (edge case), just return best effort (client will ellipsize)
     console.log(`← /summarize 200 words=${words}`);
     return res.json({ summary });
   } catch (err) {
