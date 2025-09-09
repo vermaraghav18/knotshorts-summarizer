@@ -1,4 +1,4 @@
-// summarizer-server.js — OpenRouter summarizer with min-words + fixed lines
+// summarizer-server.js — OpenRouter summarizer: single paragraph, min words
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -7,22 +7,19 @@ const cors = require('cors');
 
 const app = express();
 app.use(bodyParser.json());
-app.use(cors({ origin: '*' })); // tighten to your domains in prod
+app.use(cors({ origin: '*' })); // tighten in production
 
 const PORT = process.env.PORT || 5000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
 // ------------------ Tunables ------------------
 const SUMMARY_MODEL = process.env.SUMMARY_MODEL || 'openai/gpt-4.1-nano';
-const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 200);
+const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 220);
 
-// Desired words & lines
 const TARGET_WORDS = Number(process.env.SUMMARY_TARGET_WORDS || 80);
 const MIN_WORDS = Number(process.env.SUMMARY_MIN_WORDS || 70);
-const MAX_WORDS = Number(process.env.SUMMARY_MAX_WORDS || 85);
-const LINES = Number(process.env.SUMMARY_LINES || 8);
+const MAX_WORDS = Number(process.env.SUMMARY_MAX_WORDS || 95);
 
-// If first pass < MIN_WORDS, retry once with an "expand" prompt
 const EXPANSION_RETRIES = Number(process.env.SUMMARY_EXPANSION_RETRIES || 1);
 // ------------------------------------------------
 
@@ -37,7 +34,7 @@ const http = axios.create({
 
 // ---------- helpers ----------
 function normalizeWhitespace(s) {
-  return String(s || '').replace(/[ \t\r\f\v]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim();
+  return String(s || '').replace(/[ \t\r\f\v]+/g, ' ').replace(/\s*\n+\s*/g, ' ').trim();
 }
 
 function countWords(s) {
@@ -50,49 +47,19 @@ function hardTrimToMaxWords(s, max) {
   return words.slice(0, max).join(' ');
 }
 
-function ensureExactLineCountByReflow(text, lineCount) {
-  // If the model didn't return exactly LINES, reflow words evenly.
-  const words = normalizeWhitespace(text).split(/\s+/).filter(Boolean);
-  if (words.length === 0) return ''.padEnd(lineCount - 1, '\n');
-
-  const perLine = Math.ceil(words.length / lineCount);
-  const lines = [];
-  for (let i = 0; i < words.length; i += perLine) {
-    lines.push(words.slice(i, i + perLine).join(' '));
-  }
-  // Guarantee exactly lineCount lines
-  while (lines.length < lineCount) lines.push('');
-  if (lines.length > lineCount) lines.length = lineCount;
-  return lines.join('\n');
-}
-
-function postProcessToConstraints(raw) {
-  // 1) Normalize
+function postProcessOneParagraph(raw) {
+  // 1) normalize to one line
   let summary = normalizeWhitespace(raw);
 
-  // 2) Remove bullets/numbers if any slipped in
-  summary = summary
-    .split('\n')
-    .map(l => l.replace(/^\s*[-•\d]+\)?\.?\s*/g, '').trim())
-    .filter(l => l.length > 0)
-    .join('\n');
+  // 2) strip bullets/numbering if any slipped in
+  summary = summary.replace(/(^|\s)[-•]\s+/g, ' ')
+                   .replace(/\s*\d+\)\s+/g, ' ')
+                   .replace(/\s*\d+\.\s+/g, ' ')
+                   .replace(/\s+/g, ' ')
+                   .trim();
 
-  // 3) If it already has newlines, keep them; otherwise we’ll reflow later.
-  //    First, enforce max words so we don't overshoot.
+  // 3) cap at MAX_WORDS if overshot
   summary = hardTrimToMaxWords(summary, MAX_WORDS);
-
-  // 4) Count words & lines
-  let words = countWords(summary);
-  let lines = summary.split('\n');
-
-  // 5) If fewer than LINES lines, reflow
-  if (lines.length !== LINES) {
-    summary = ensureExactLineCountByReflow(summary, LINES);
-    words = countWords(summary);
-  }
-
-  // 6) If still below MIN_WORDS (rare after expand), we can't invent content here.
-  //    We'll let the caller decide to retry. For now, return the best effort.
   return summary;
 }
 
@@ -108,15 +75,9 @@ async function callOpenRouter(messages) {
 }
 
 async function generateSummaryFirstPass(text) {
-  const wordsPerLineLow = Math.max(7, Math.floor((TARGET_WORDS - 10) / LINES));
-  const wordsPerLineHigh = Math.ceil((TARGET_WORDS + 10) / LINES);
-
-  const system = [
-    'You are a concise news summarizer.',
-    `Write EXACTLY ${LINES} separate lines (use plain newlines).`,
-    `Aim for ~${TARGET_WORDS} words total; roughly ${wordsPerLineLow}-${wordsPerLineHigh} words per line.`,
-    'No bullets or numbering. No headings. Keep facts tight and readable.',
-  ].join(' ');
+  const system =
+    `You are a precise news summarizer. Write ONE single-paragraph summary (~${TARGET_WORDS} words). ` +
+    `Absolutely no line breaks, bullets, or headings. Output plain text only. Be faithful to the source.`;
 
   const messages = [
     { role: 'system', content: system },
@@ -126,25 +87,21 @@ async function generateSummaryFirstPass(text) {
   return await callOpenRouter(messages);
 }
 
-async function expandSummaryToMin(text, firstSummary) {
-  const wordsPerLineLow = Math.max(7, Math.floor((TARGET_WORDS - 10) / LINES));
-  const wordsPerLineHigh = Math.ceil((TARGET_WORDS + 10) / LINES);
-
-  const system = [
-    'Improve and EXPAND the given summary while staying faithful to the source.',
-    `Return EXACTLY ${LINES} lines separated by newlines, no bullets or numbering.`,
-    `Ensure AT LEAST ${MIN_WORDS} words total, aiming near ${TARGET_WORDS} words; roughly ${wordsPerLineLow}-${wordsPerLineHigh} words per line.`,
-    'Keep it readable and concise; do not add speculation.',
-  ].join(' ');
+async function expandSummaryToMin(text, current) {
+  const system =
+    `Improve and EXPAND the summary into ONE single paragraph. ` +
+    `Ensure AT LEAST ${MIN_WORDS} words, aiming near ${TARGET_WORDS}. ` +
+    `No line breaks, bullets, or headings. Output plain text only. Stay factual.`;
 
   const messages = [
     { role: 'system', content: system },
     { role: 'user', content: `SOURCE TEXT:\n${String(text)}` },
-    { role: 'user', content: `CURRENT (TO EXPAND):\n${String(firstSummary)}` },
+    { role: 'user', content: `CURRENT SUMMARY (TO EXPAND):\n${String(current)}` },
   ];
 
   return await callOpenRouter(messages);
 }
+
 // ----------------------------------------------
 
 app.get('/', (_req, res) => res.json({ ok: true })); // health check
@@ -160,29 +117,25 @@ app.post('/summarize', async (req, res) => {
   try {
     // First attempt
     let raw = await generateSummaryFirstPass(text);
-    let summary = postProcessToConstraints(raw);
+    let summary = postProcessOneParagraph(raw);
     let words = countWords(summary);
-    let lineCount = summary.split('\n').length;
 
     // Retry to meet MIN_WORDS if needed
     let retriesLeft = EXPANSION_RETRIES;
     while (words < MIN_WORDS && retriesLeft > 0) {
       const expanded = await expandSummaryToMin(text, summary);
-      summary = postProcessToConstraints(expanded);
+      summary = postProcessOneParagraph(expanded);
       words = countWords(summary);
-      lineCount = summary.split('\n').length;
       retriesLeft--;
     }
 
-    // Final safety: if we still somehow exceed MAX_WORDS (rare), hard trim & reflow
+    // Final safety: hard trim if still too long
     if (words > MAX_WORDS) {
       summary = hardTrimToMaxWords(summary, MAX_WORDS);
-      summary = ensureExactLineCountByReflow(summary, LINES);
       words = countWords(summary);
-      lineCount = summary.split('\n').length;
     }
 
-    console.log(`← /summarize 200 words≈${words} lines=${lineCount}`);
+    console.log(`← /summarize 200 words≈${words}`);
     return res.json({ summary });
   } catch (err) {
     const status = err?.response?.status || 500;
