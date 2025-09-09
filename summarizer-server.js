@@ -11,8 +11,37 @@ app.use(cors({ origin: '*' })); // tighten to your domains in production
 
 const PORT = process.env.PORT || 5000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+
+// Model & length controls
 const SUMMARY_MODEL = process.env.SUMMARY_MODEL || 'openai/gpt-4.1-nano';
-const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 120);
+// 80 words ≈ 110–130 tokens. Give a little headroom.
+const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 160);
+
+// ----- helpers -----
+function normalizeWhitespace(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+function trimToWords(text, maxWords) {
+  const words = normalizeWhitespace(text).split(' ');
+  return words.slice(0, maxWords).join(' ');
+}
+
+function splitIntoLinesByWords(text, targetLines) {
+  const words = normalizeWhitespace(text).split(' ');
+  if (words.length === 0) return '';
+
+  const lines = Math.max(1, targetLines);
+  const chunkSize = Math.ceil(words.length / lines);
+
+  const chunks = [];
+  for (let i = 0; i < words.length; i += chunkSize) {
+    chunks.push(words.slice(i, i + chunkSize).join(' '));
+  }
+  return chunks.join('\n');
+}
+
+// -------------------
 
 app.get('/', (_req, res) => res.json({ ok: true })); // health check
 
@@ -30,7 +59,12 @@ app.post('/summarize', async (req, res) => {
       {
         model: SUMMARY_MODEL,
         messages: [
-          { role: 'system', content: 'Summarize the user text in 1–3 concise sentences.' },
+          {
+            role: 'system',
+            content:
+              // Ask for ~80 words, formatted as 7–8 plain lines (no bullets/numbers).
+              'You are a concise summarizer. Return ~80 words split into 7–8 short lines. Each line should be a simple sentence or phrase. Use plain newlines between lines. Do not add numbering, bullets, headings, or extra commentary.'
+          },
           { role: 'user', content: String(text) }
         ],
         max_tokens: SUMMARY_MAX_TOKENS,
@@ -46,8 +80,17 @@ app.post('/summarize', async (req, res) => {
       }
     );
 
-    const summary = r?.data?.choices?.[0]?.message?.content || '';
-    console.log(`← /summarize 200 len=${(summary || '').length}`);
+    // Raw model output
+    let summary = r?.data?.choices?.[0]?.message?.content || '';
+    summary = normalizeWhitespace(summary);
+
+    // Enforce ~80 words hard cap
+    summary = trimToWords(summary, 80);
+
+    // Enforce 7–8 lines (default to 8). If fewer words, you'll naturally get fewer lines.
+    summary = splitIntoLinesByWords(summary, 8);
+
+    console.log(`← /summarize 200 words≈${summary.split(/\s+/).filter(Boolean).length} lines=${summary.split('\n').length}`);
 
     res.json({ summary });
   } catch (err) {
